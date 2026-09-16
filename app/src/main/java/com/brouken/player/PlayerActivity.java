@@ -131,6 +131,7 @@ import androidx.media3.exoplayer.audio.AudioRendererEventListener;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
 import androidx.media3.exoplayer.audio.ForwardingAudioSink;
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
@@ -339,6 +340,10 @@ public class PlayerActivity extends Activity {
     // pendingStuckRecovery marks that rebuild so the reset in initializePlayer keeps the flag.
     // Read by the codec selector on the playback thread.
     private volatile boolean forceHevcForDolbyVision;
+    // Recovery for regular HEVC (non-DV) decoding failures: force software decoder when hardware fails.
+    // This handles cases where device's hardware HEVC decoder fails with CodecException on certain
+    // HEVC profiles/levels (e.g., hvc1.4.10.H120.9C.08 on some devices).
+    private volatile boolean forceSoftwareHevc;
     private boolean pendingStuckRecovery;
     // Installed for this player build when Dolby Vision profile 7 is being rewritten as profile 8.1;
     // null when it is not. Kept only so the dump can say which mode the stream actually got.
@@ -346,6 +351,7 @@ public class PlayerActivity extends Activity {
     private Dv7Converter dv7Converter;
     // Per process, not per player: a device that keeps needing the fallback must not re-report it.
     private static boolean dolbyVisionFallbackReported;
+    private static boolean softwareHevcFallbackReported;
     // Names of the decoders that actually opened, for the error report. The mime does not tell them apart
     // — c2.android.* (software) and OMX.<vendor>.* (hardware) decode the same hevc very differently — and
     // "the device decoder wedged" is unreadable without knowing which one it was. Written on the app
@@ -9594,6 +9600,7 @@ public class PlayerActivity extends Activity {
             pendingStuckRecovery = false;
         } else {
             forceHevcForDolbyVision = false;
+            forceSoftwareHevc = false;
         }
 
         // Fresh player — the source re-read budget starts over.
@@ -9752,21 +9759,36 @@ public class PlayerActivity extends Activity {
                 // of letting the next candidate try.
                 .setEnableDecoderFallback(true)
                 .setMapDV7ToHevc(mPrefs.mapDV7ToHevc);
-        if (forceHevcForDolbyVision || blockHeavyMkvAudio) {
-            // One combined codec selector for two independent needs:
+        if (forceHevcForDolbyVision || forceSoftwareHevc || blockHeavyMkvAudio) {
+            // One combined codec selector for three independent needs:
             // - blockHeavyMkvAudio: no platform decoder for the heavy MKV audio codecs, so they
             //   passthrough (if the sink supports it) or fall back to ffmpeg (see above).
             // - forceHevcForDolbyVision: route a Dolby Vision track to the plain HEVC decoder (its base
             //   layer is HEVC), bypassing a device DV decoder that wedged or failed while decoding.
             //   Picture stays HDR10.
+            // - forceSoftwareHevc: route HEVC video to software decoder when hardware decoder fails
+            //   on certain profiles/levels (e.g., hvc1.4.10.H120.9C.08).
             renderersFactory.setMediaCodecSelector((mimeType, requiresSecureDecoder, requiresTunnelingDecoder) -> {
                 if (blockHeavyMkvAudio && HEAVY_MKV_AUDIO_MIMES.contains(mimeType)) {
                     return Collections.emptyList();
                 }
+                String targetMimeType = mimeType;
+                if (forceHevcForDolbyVision && MimeTypes.VIDEO_DOLBY_VISION.equals(mimeType)) {
+                    targetMimeType = MimeTypes.VIDEO_H265;
+                } else if (forceSoftwareHevc && MimeTypes.VIDEO_H265.equals(mimeType)) {
+                    // Force software HEVC decoder by filtering out hardware decoders
+                    List<MediaCodecInfo> allDecoders = MediaCodecSelector.DEFAULT.getDecoderInfos(
+                            mimeType, requiresSecureDecoder, requiresTunnelingDecoder);
+                    List<MediaCodecInfo> softwareDecoders = new ArrayList<>();
+                    for (MediaCodecInfo decoder : allDecoders) {
+                        if (decoder.name.startsWith("c2.android.")) {
+                            softwareDecoders.add(decoder);
+                        }
+                    }
+                    return softwareDecoders.isEmpty() ? allDecoders : softwareDecoders;
+                }
                 return MediaCodecSelector.DEFAULT.getDecoderInfos(
-                        forceHevcForDolbyVision && MimeTypes.VIDEO_DOLBY_VISION.equals(mimeType)
-                                ? MimeTypes.VIDEO_H265 : mimeType,
-                        requiresSecureDecoder, requiresTunnelingDecoder);
+                        targetMimeType, requiresSecureDecoder, requiresTunnelingDecoder);
             });
         }
 
@@ -10934,10 +10956,17 @@ public class PlayerActivity extends Activity {
             // that error code — a decoder-init failure was already offered the HEVC decoders as fallback
             // candidates, so those have failed too and rebuilding for them would be a pointless teardown.
             if (error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED
-                    && error instanceof ExoPlaybackException
-                    && recoverByForcingHevcForDolbyVision(error,
-                            ((ExoPlaybackException) error).rendererFormat)) {
-                return;
+                    && error instanceof ExoPlaybackException) {
+                // First try DV -> HEVC fallback
+                if (recoverByForcingHevcForDolbyVision(error,
+                        ((ExoPlaybackException) error).rendererFormat)) {
+                    return;
+                }
+                // Then try regular HEVC -> software fallback
+                if (recoverByForcingSoftwareHevc(error,
+                        ((ExoPlaybackException) error).rendererFormat)) {
+                    return;
+                }
             }
             // The remembered clip can no longer be opened: a foreign app's one-off URI grant has
             // expired (a video streamed from a messenger, reopened after that app restarted) or the
@@ -11156,6 +11185,50 @@ public class PlayerActivity extends Activity {
         restorePlayState = player.getPlayWhenReady();
         // Rebuild on the next loop, after this onPlayerError callback returns, so the player is not
         // released while its own listener is executing.
+        playerView.post(() -> {
+            releasePlayer();
+            initializePlayer();
+        });
+        return true;
+    }
+
+    // Rebuild the player forcing regular HEVC video through the software decoder when hardware decoder
+    // fails with ERROR_CODE_DECODING_FAILED. This handles cases where device's hardware HEVC decoder
+    // fails on certain profiles/levels (e.g., hvc1.4.10.H120.9C.08 - Main 10 Profile, Level 5.1).
+    // The software decoder (c2.android.hevc.decoder) is more tolerant of edge-case profiles.
+    // Returns true when a recovery rebuild was scheduled.
+    private boolean recoverByForcingSoftwareHevc(PlaybackException error, Format failingFormat) {
+        if (player == null || forceSoftwareHevc || failingFormat == null) {
+            return false;
+        }
+        // Only apply to HEVC video tracks that are NOT Dolby Vision (DV is handled by recoverByForcingHevcForDolbyVision)
+        if (!MimeTypes.VIDEO_H265.equals(failingFormat.sampleMimeType)
+                || MimeTypes.VIDEO_DOLBY_VISION.equals(failingFormat.sampleMimeType)) {
+            return false;
+        }
+        // Check if the failing decoder is a hardware decoder (not c2.android.*)
+        // This ensures we only fall back to software when hardware fails
+        String decoderName = videoDecoderName;
+        if (decoderName != null && decoderName.startsWith("c2.android.")) {
+            // Already using software decoder, don't retry
+            return false;
+        }
+        // Once per process, as information rather than an error
+        if (!softwareHevcFallbackReported) {
+            softwareHevcFallbackReported = true;
+            io.sentry.Sentry.captureException(error, scope -> {
+                scope.setFingerprint(Collections.singletonList("hevc-software-fallback"));
+                scope.setLevel(io.sentry.SentryLevel.INFO);
+                enrichPlaybackScope(error, scope);
+                scope.setTag("media.video_codecs", String.valueOf(failingFormat.codecs));
+                scope.setTag("media.video_decoder", String.valueOf(decoderName));
+            });
+        }
+        forceSoftwareHevc = true;
+        pendingStuckRecovery = true;
+        // Only resume if it was playing
+        restorePlayState = player.getPlayWhenReady();
+        // Rebuild on the next loop, after this onPlayerError callback returns
         playerView.post(() -> {
             releasePlayer();
             initializePlayer();
